@@ -1,11 +1,15 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import Editor, { type OnMount } from "@monaco-editor/react";
+import Editor, { type OnMount, loader } from "@monaco-editor/react";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readDir, readTextFile } from "@tauri-apps/plugin-fs";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import { invoke } from "@tauri-apps/api/core";
+import * as monaco from 'monaco-editor';
 import "./App.css";
+
+// Configure Monaco to use local package instead of CDN
+loader.config({ monaco });
 
 interface FileNode {
   name: string;
@@ -81,16 +85,27 @@ function App() {
   const [editorSettings, setEditorSettings] = useState<EditorSettings>(DEFAULT_EDITOR);
   const [draftProvider, setDraftProvider] = useState<ProviderSettings>(DEFAULT_PROVIDER);
   const [draftEditor, setDraftEditor] = useState<EditorSettings>(DEFAULT_EDITOR);
+  const [embeddingApiKey, setEmbeddingApiKey] = useState<string>("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
+  const [contextFiles, setContextFiles] = useState<string[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof import('monaco-editor') | null>(null);
   const completionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingCompletionRef = useRef<string | null>(null);
   const completionAbortRef = useRef(false);
+  const completionProviderRef = useRef<any>(null);
   const [isCompleting, setIsCompleting] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalOutput, setTerminalOutput] = useState<string>("");
+  const [terminalInput, setTerminalInput] = useState<string>("");
+  const [terminalHeight, setTerminalHeight] = useState(200);
+  const [terminalId, setTerminalId] = useState<string | null>(null);
+  const terminalOutputRef = useRef<HTMLDivElement>(null);
+  const terminalResizingRef = useRef(false);
+  const [indexStatus, setIndexStatus] = useState<{ type: 'idle' | 'indexing' | 'ready' | 'error'; message: string }>({ type: 'idle', message: '' });
 
   // Load settings on startup
   useEffect(() => {
@@ -99,6 +114,8 @@ function App() {
         const store = await getStore();
         const savedProvider = await store.get<ProviderSettings>("provider");
         const savedEditor = await store.get<EditorSettings>("editor");
+        const savedEmbeddingKey = await store.get<string>("embeddingApiKey");
+        
         if (savedProvider) {
           setProviderSettings(savedProvider);
           setDraftProvider(savedProvider);
@@ -107,17 +124,47 @@ function App() {
           setEditorSettings(savedEditor);
           setDraftEditor(savedEditor);
         }
+        
+        // Set embedding API key, defaulting to existing NIM key if not set
+        if (savedEmbeddingKey) {
+          setEmbeddingApiKey(savedEmbeddingKey);
+        } else if (savedProvider?.nvidiaApiKey) {
+          setEmbeddingApiKey(savedProvider.nvidiaApiKey);
+        }
       } catch (error) {
         console.error("Error loading settings:", error);
       }
     })();
   }, []);
 
+  // Background index workspace when folder opens
+  useEffect(() => {
+    if (!rootPath || !embeddingApiKey) return;
+
+    const runIndex = async () => {
+      setIndexStatus({ type: 'indexing', message: 'Indexing...' });
+      try {
+        const result = await invoke<{ indexed: number; total: number }>('index_workspace', {
+          folderPath: rootPath,
+          apiKey: embeddingApiKey
+        });
+        setIndexStatus({ type: 'ready', message: `Index ready (${result.indexed} files)` });
+      } catch (error) {
+        const errMsg = typeof error === 'string' ? error : (error as Error).message || 'Unknown error';
+        setIndexStatus({ type: 'error', message: `Index failed: ${errMsg}` });
+        console.error('Indexing error:', error);
+      }
+    };
+
+    runIndex();
+  }, [rootPath, embeddingApiKey]);
+
   const saveSettings = useCallback(async () => {
     try {
       const store = await getStore();
       await store.set("provider", draftProvider);
       await store.set("editor", draftEditor);
+      await store.set("embeddingApiKey", embeddingApiKey);
       await store.save();
       setProviderSettings(draftProvider);
       setEditorSettings(draftEditor);
@@ -125,7 +172,7 @@ function App() {
     } catch (error) {
       console.error("Error saving settings:", error);
     }
-  }, [draftProvider, draftEditor]);
+  }, [draftProvider, draftEditor, embeddingApiKey]);
 
   const getLanguageFromExtension = useCallback((filename: string): string => {
     const ext = filename.split('.').pop()?.toLowerCase();
@@ -195,11 +242,6 @@ function App() {
     }
   }, [getLanguageFromExtension, tabs]);
 
-  const handleEditorChange = useCallback((value: string | undefined) => {
-    if (!activeTabPath || value === undefined) return;
-    setTabs(prev => prev.map(t => t.path === activeTabPath ? { ...t, content: value } : t));
-  }, [activeTabPath]);
-
   const closeTab = useCallback((tabPath: string) => {
     setTabs(prev => {
       const idx = prev.findIndex(t => t.path === tabPath);
@@ -260,6 +302,250 @@ function App() {
     }
   }, [providerSettings]);
 
+  const triggerCompletion = useCallback(async () => {
+    if (!editorRef.current || !activeTab) return;
+
+    const position = editorRef.current.getPosition();
+    if (!position) return;
+
+    const model = editorRef.current.getModel();
+    if (!model) return;
+
+    // Get text on current line
+    const lineContent = model.getLineContent(position.lineNumber);
+    const textBeforeCursor = lineContent.substring(0, position.column - 1);
+
+    // Only trigger if at least 3 characters typed on current line
+    if (textBeforeCursor.trim().length < 3) return;
+
+    completionAbortRef.current = false;
+    setIsCompleting(true);
+
+    const config = getProviderConfig();
+    const systemPrompt = `You are a code completion engine. Complete the code at the cursor. Return ONLY the completion text, no explanation, no markdown, no backticks. Just the raw code that comes next.`;
+
+    // Get last 2000 chars of file content before cursor for context
+    const fullContentBeforeCursor = model.getValueInRange({
+      startLineNumber: 1,
+      startColumn: 1,
+      endLineNumber: position.lineNumber,
+      endColumn: position.column,
+    });
+    const contextLength = Math.min(fullContentBeforeCursor.length, 2000);
+    const context = fullContentBeforeCursor.slice(-contextLength);
+
+    try {
+      const url = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+      const result = await invoke<string>('ai_chat', {
+        url,
+        apiKey: config.apiKey,
+        model: config.model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: context },
+        ],
+      });
+
+      if (completionAbortRef.current) return;
+
+      const parsed = JSON.parse(result);
+      const completionText = parsed.choices?.[0]?.message?.content?.trim() || '';
+
+      if (!completionText || completionAbortRef.current) {
+        setIsCompleting(false);
+        return;
+      }
+
+      // Register inline completion provider
+      if (monacoRef.current) {
+        const monaco = monacoRef.current;
+        
+        // Dispose previous provider if it exists
+        if (completionProviderRef.current) {
+          completionProviderRef.current.dispose();
+        }
+
+        const provider = {
+          provideInlineCompletions: () => ({
+            items: [
+              {
+                insertText: completionText,
+                range: new monaco.Range(
+                  position.lineNumber,
+                  position.column,
+                  position.lineNumber,
+                  position.column
+                ),
+              },
+            ],
+          }),
+        } as any;
+
+        completionProviderRef.current = monaco.languages.registerInlineCompletionsProvider(
+          activeTab.language,
+          provider
+        );
+
+        pendingCompletionRef.current = completionText;
+      }
+    } catch (error) {
+      console.error('Completion request failed:', error);
+      setIsCompleting(false);
+    }
+  }, [activeTab, getProviderConfig]);
+
+  const handleEditorMount: OnMount = useCallback((editor, monaco) => {
+    editorRef.current = editor;
+    monacoRef.current = monaco;
+
+    // Register keyboard shortcuts for Tab (accept) and Escape (dismiss)
+    editor.addCommand(monaco.KeyCode.Tab, () => {
+      if (pendingCompletionRef.current) {
+        const position = editor.getPosition();
+        if (position) {
+          editor.executeEdits('complete', [
+            {
+              range: new monaco.Range(
+                position.lineNumber,
+                position.column,
+                position.lineNumber,
+                position.column
+              ),
+              text: pendingCompletionRef.current,
+            },
+          ]);
+          pendingCompletionRef.current = null;
+          setIsCompleting(false);
+        }
+      }
+    });
+
+    editor.addCommand(monaco.KeyCode.Escape, () => {
+      if (pendingCompletionRef.current) {
+        pendingCompletionRef.current = null;
+        setIsCompleting(false);
+        completionAbortRef.current = true;
+      }
+    });
+  }, []);
+
+  const handleEditorChangeWithCompletion = useCallback((value: string | undefined) => {
+    if (!activeTabPath || value === undefined) return;
+    
+    // Update tab content
+    setTabs(prev => prev.map(t => t.path === activeTabPath ? { ...t, content: value } : t));
+
+    // Reset completion abort flag on keystroke
+    completionAbortRef.current = true;
+    pendingCompletionRef.current = null;
+    setIsCompleting(false);
+
+    // Clear existing timer
+    if (completionTimerRef.current) {
+      clearTimeout(completionTimerRef.current);
+    }
+
+    // Set new debounce timer for completion trigger (600ms)
+    completionTimerRef.current = setTimeout(() => {
+      triggerCompletion();
+    }, 600);
+  }, [activeTabPath, triggerCompletion]);
+
+  const clearTerminal = useCallback(() => {
+    setTerminalOutput("");
+  }, []);
+
+  // Spawn terminal when first opened
+  useEffect(() => {
+    if (terminalOpen && !terminalId) {
+      const spawnTerm = async () => {
+        try {
+          const cwd = rootPath || "";
+          const id = await invoke<string>('spawn_terminal', { cwd });
+          setTerminalId(id);
+          setTerminalOutput("Terminal started\n");
+        } catch (error) {
+          setTerminalOutput(`Failed to start terminal: ${error}\n`);
+        }
+      };
+      spawnTerm();
+    }
+  }, [terminalOpen, terminalId, rootPath]);
+
+  // Kill terminal when closed
+  useEffect(() => {
+    if (!terminalOpen && terminalId) {
+      invoke('kill_terminal', { terminalId }).catch(console.error);
+      setTerminalId(null);
+    }
+  }, [terminalOpen, terminalId]);
+
+  // Poll for terminal output
+  useEffect(() => {
+    if (!terminalId || !terminalOpen) return;
+    
+    const interval = setInterval(async () => {
+      try {
+        const output = await invoke<[string, string][]>('read_terminal_output', { terminalId });
+        if (output.length > 0) {
+          const text = output.map(([type, line]) => {
+            if (type === 'stderr') return `<span class="terminal-error">${line}</span>`;
+            return line;
+          }).join('\n');
+          setTerminalOutput(prev => prev + (prev ? '\n' : '') + text);
+        }
+      } catch (error) {
+        console.error('Failed to read terminal output:', error);
+      }
+    }, 100);
+
+    return () => clearInterval(interval);
+  }, [terminalId, terminalOpen]);
+
+  const handleTerminalInput = useCallback(async () => {
+    const input = terminalInput.trim();
+    if (!input || !terminalId) return;
+
+    setTerminalOutput(prev => prev + `\n> ${input}\n`);
+    
+    try {
+      await invoke('write_terminal_input', { terminalId, input });
+    } catch (error) {
+      setTerminalOutput(prev => prev + `Error: ${error}\n`);
+    }
+    
+    setTerminalInput("");
+  }, [terminalInput, terminalId]);
+
+  const handleTerminalResize = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    terminalResizingRef.current = true;
+    const startY = e.clientY;
+    const startHeight = terminalHeight;
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      if (!terminalResizingRef.current) return;
+      const deltaY = startY - moveEvent.clientY;
+      const newHeight = Math.max(100, Math.min(600, startHeight + deltaY));
+      setTerminalHeight(newHeight);
+    };
+
+    const handleMouseUp = () => {
+      terminalResizingRef.current = false;
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+  }, [terminalHeight]);
+
+  useEffect(() => {
+    if (terminalOutputRef.current) {
+      terminalOutputRef.current.scrollTop = terminalOutputRef.current.scrollHeight;
+    }
+  }, [terminalOutput]);
+
   const sendMessage = useCallback(async () => {
     const text = chatInput.trim();
     if (!text || isStreaming) return;
@@ -271,16 +557,73 @@ function App() {
 
     const config = getProviderConfig();
     const fileContent = activeTab?.content || "";
-    const filePath = activeTabPath || "";
 
-    const systemMsg = `You are an expert coding assistant built into Lexer, a code editor. The user currently has this file open:\n\nFile: ${filePath}\n\n\`\`\`\n${fileContent}\n\`\`\``;
+    // Search for relevant codebase context
+    let relevantChunks: any[] = [];
+    let usedContextFiles: string[] = [];
+    
+    console.log('=== SEARCH DEBUG ===');
+    console.log('Searching index for:', text);
+    console.log('Current folder path:', rootPath);
+    console.log('Embedding API key set:', embeddingApiKey ? 'yes' : 'no');
+    console.log('Condition check:');
+    console.log('  - rootPath exists:', !!rootPath);
+    console.log('  - embedding api key exists:', !!embeddingApiKey);
+    console.log('  - all conditions met:', !!(rootPath && embeddingApiKey));
+    
+    if (rootPath && embeddingApiKey) {
+      try {
+        const searchResults = await invoke<any[]>('search_index', {
+          query: text,
+          apiKey: embeddingApiKey,
+          folderPath: rootPath
+        });
+        
+        console.log('Search results:', searchResults);
+        console.log('Raw search results:', JSON.stringify(searchResults, null, 2));
+        
+        // Filter by similarity score > 0.25 and take top 5
+        relevantChunks = searchResults
+          .filter((result: any) => result.similarity_score > 0.25)
+          .slice(0, 5);
+          
+        console.log('Filtered chunks:', relevantChunks.length);
+        console.log('Similarity scores:', searchResults.map((r: any) => r.similarity_score));
+          
+        usedContextFiles = relevantChunks.map((chunk: any) => chunk.file_path);
+      } catch (error) {
+        console.error('Failed to search index:', error);
+      }
+    }
+
+    // Build system prompt with context
+    const contextSection = relevantChunks.length > 0 
+      ? `RELEVANT PROJECT CODE:\n\n${relevantChunks.map((chunk: any) => 
+          `File: ${chunk.file_path}\n\`\`\`\n${chunk.content}\n\`\`\``
+        ).join('\n\n')}`
+      : 'No additional context available.';
+
+    const systemPrompt = `You are an expert coding assistant. 
+The user has opened a software project. Answer questions 
+about the project using the context provided below.
+
+${contextSection}
+
+${activeTabPath ? `CURRENTLY OPEN FILE:\nFile: ${activeTabPath}\n\`\`\`\n${fileContent}\n\`\`\`` : ''}
+
+Answer based on the actual project code shown above.`;
+
+    setContextFiles(usedContextFiles);
 
     const conversationHistory = [...messages, userMsg]
       .filter(m => m.role !== "error")
       .map(m => ({ role: m.role, content: m.content }));
 
+    console.log('=== FINAL SYSTEM PROMPT ===');
+    console.log(systemPrompt);
+
     const requestMessages = [
-      { role: "system" as const, content: systemMsg },
+      { role: "system" as const, content: systemPrompt },
       ...conversationHistory,
     ];
 
@@ -348,24 +691,53 @@ function App() {
             </div>
           ))}
           <button className="settings-btn" onClick={() => { setDraftProvider(providerSettings); setDraftEditor(editorSettings); setSettingsOpen(true); }}>⚙</button>
+          <button className="terminal-btn" onClick={() => setTerminalOpen(!terminalOpen)} title="Toggle Terminal">⌨</button>
         </div>
-        <div className="editor-area">
-          <Editor
-            height="100%"
-            language={activeTab?.language || 'typescript'}
-            theme="vs-dark"
-            value={activeTab?.content || ''}
-            onChange={handleEditorChange}
-            options={{
-              minimap: { enabled: false },
-              fontSize: editorSettings.fontSize,
-              lineNumbers: "on",
-              scrollBeyondLastLine: false,
-              automaticLayout: true,
-              tabSize: editorSettings.tabSize,
-              wordWrap: editorSettings.wordWrap ? "on" : "off",
-            }}
-          />
+        <div className="editor-container-inner">
+          <div className="editor-area">
+            <Editor
+              height="100%"
+              language={activeTab?.language || 'typescript'}
+              theme="vs-dark"
+              value={activeTab?.content || ''}
+              onChange={handleEditorChangeWithCompletion}
+              onMount={handleEditorMount}
+              options={{
+                minimap: { enabled: false },
+                fontSize: editorSettings.fontSize,
+                lineNumbers: "on",
+                scrollBeyondLastLine: false,
+                automaticLayout: true,
+                tabSize: editorSettings.tabSize,
+                wordWrap: editorSettings.wordWrap ? "on" : "off",
+              }}
+            />
+            {isCompleting && <div className="completion-loading">⟳</div>}
+          </div>
+
+          {terminalOpen && (
+            <>
+              <div className="terminal-divider" onMouseDown={handleTerminalResize} />
+              <div className="terminal-panel" style={{ height: `${terminalHeight}px` }}>
+                <div className="terminal-header">
+                  <span className="terminal-title">Terminal</span>
+                  <button className="terminal-clear" onClick={clearTerminal}>Clear</button>
+                </div>
+                <div className="terminal-output" ref={terminalOutputRef} dangerouslySetInnerHTML={{ __html: terminalOutput || '<span class="terminal-prompt">Ready</span>' }} />
+                <div className="terminal-input-area">
+                  <span className="terminal-prompt-char">❯</span>
+                  <input
+                    type="text"
+                    className="terminal-input"
+                    placeholder="Enter command..."
+                    value={terminalInput}
+                    onChange={(e) => setTerminalInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") handleTerminalInput(); }}
+                  />
+                </div>
+              </div>
+            </>
+          )}
         </div>
       </main>
 
@@ -383,6 +755,24 @@ function App() {
                 <div key={i} className={`chat-bubble chat-bubble-${msg.role}`}>
                   <div className="chat-bubble-role">{msg.role === "user" ? "You" : msg.role === "assistant" ? "AI" : "Error"}</div>
                   <div className="chat-bubble-content">{msg.content}</div>
+                  {msg.role === "assistant" && i === messages.length - 1 && (
+                    <div className="chat-context">
+                      <div className="chat-context-header" onClick={() => {
+                        const el = document.querySelector(`.chat-context-files-${i}`);
+                        if (el) {
+                          el.classList.toggle('chat-context-files-expanded');
+                        }
+                      }}>
+                        Context used: {contextFiles.length > 0 ? `${contextFiles.length} files` : 'Active file only'}
+                        <span className="chat-context-toggle">▼</span>
+                      </div>
+                      <div className={`chat-context-files chat-context-files-${i}`}>
+                        {contextFiles.map((file, j) => (
+                          <div key={j} className="chat-context-file">{file}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               ))
             )}
@@ -469,6 +859,18 @@ function App() {
                 </>
               )}
 
+              <h3>Workspace Indexing</h3>
+              <div className="settings-group">
+                <label className="settings-label">NIM Embedding API Key (for workspace indexing)</label>
+                <input 
+                  className="settings-input" 
+                  type="password" 
+                  value={embeddingApiKey} 
+                  onChange={(e) => setEmbeddingApiKey(e.target.value)} 
+                  placeholder="nvapi-..." 
+                />
+              </div>
+
               <h3>Editor</h3>
               <div className="settings-group">
                 <label className="settings-label">Font Size ({draftEditor.fontSize})</label>
@@ -496,6 +898,13 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* Status Bar */}
+      <div className="status-bar">
+        <span className={`index-status index-status-${indexStatus.type}`}>
+          {indexStatus.message || 'Ready'}
+        </span>
+      </div>
     </div>
   );
 }

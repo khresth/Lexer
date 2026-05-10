@@ -14,7 +14,17 @@
     "fs:allow-write-text-file",
     "fs:allow-exists",
     "fs:allow-stat",
+    "fs:scope-app-recursive",
+    "fs:scope-home-recursive",
+    "fs:scope-desktop-recursive",
+    "fs:scope-document-recursive",
     "store:default",
-    "http:default"
+    "http:default",
+    "shell:default",
+    "shell:allow-execute",
+    "shell:allow-spawn",
+    "shell:allow-kill",
+    "shell:allow-stdin-write",
+    "shell:allow-open"
   ]
 }
