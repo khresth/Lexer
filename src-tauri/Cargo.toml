@@ -1,8 +1,8 @@
 [package]
-name = "tauri-app"
+name = "lexer"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "AI-powered code editor with local and cloud model support"
+authors = ["Lexer"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

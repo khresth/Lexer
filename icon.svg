@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Background -->
+  <rect width="512" height="512" rx="80" fill="#6C3CE1"/>
+  
+  <!-- Letter L — centered with symmetric horizontal bounds -->
+  <!-- Overall L bounds: x=153..359 (center = 256) -->
+  <rect x="153" y="120" width="88" height="320" rx="8" fill="white"/>
+  
+  <!-- Horizontal stroke of L: bottom bar -->
+  <rect x="153" y="350" width="206" height="90" rx="8" fill="white"/>
+</svg>
