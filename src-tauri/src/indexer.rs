@@ -1,5 +1,6 @@
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -19,6 +20,51 @@ pub struct SearchResult {
     pub file_path: String,
     pub content: String,
     pub similarity_score: f32,
+}
+
+#[derive(Clone, Debug)]
+struct EmbeddingConfig {
+    provider: String,
+    api_key: String,
+    base_url: String,
+    model: String,
+}
+
+impl EmbeddingConfig {
+    fn normalize(
+        provider: Option<String>,
+        api_key: String,
+        base_url: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        let provider = provider.unwrap_or_else(|| "nim".to_string()).to_lowercase();
+        match provider.as_str() {
+            "ollama" => Self {
+                provider,
+                api_key: String::new(),
+                base_url: base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+                model: model.unwrap_or_else(|| "nomic-embed-text".to_string()),
+            },
+            "groq" => Self {
+                provider,
+                api_key,
+                base_url: base_url.unwrap_or_else(|| "https://api.groq.com/openai/v1".to_string()),
+                model: model.unwrap_or_else(|| "llama-3.1-8b-instant".to_string()),
+            },
+            "custom" => Self {
+                provider,
+                api_key,
+                base_url: base_url.unwrap_or_default(),
+                model: model.unwrap_or_default(),
+            },
+            _ => Self {
+                provider: "nim".to_string(),
+                api_key,
+                base_url: base_url.unwrap_or_else(|| "https://integrate.api.nvidia.com/v1".to_string()),
+                model: model.unwrap_or_else(|| "nvidia/nv-embedqa-e5-v5".to_string()),
+            },
+        }
+    }
 }
 
 fn get_db_path(folder_path: &str) -> std::path::PathBuf {
@@ -49,8 +95,53 @@ fn init_db(conn: &mut Connection) -> Result<(), String> {
     // Add embedding column if it doesn't exist (for backward compatibility)
     // SQLite will return error if column already exists, which we ignore
     let _ = conn.execute("ALTER TABLE chunks ADD COLUMN embedding TEXT", []);
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS index_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    ).map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+fn save_embedding_metadata(conn: &Connection, config: &EmbeddingConfig) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO index_metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params!["embedding_provider", config.provider],
+    ).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO index_metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params!["embedding_base_url", config.base_url],
+    ).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO index_metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params!["embedding_model", config.model],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_embedding_metadata(conn: &Connection) -> EmbeddingConfig {
+    let provider = conn.query_row(
+        "SELECT value FROM index_metadata WHERE key = 'embedding_provider'",
+        [],
+        |row| row.get::<_, String>(0),
+    ).ok();
+    let base_url = conn.query_row(
+        "SELECT value FROM index_metadata WHERE key = 'embedding_base_url'",
+        [],
+        |row| row.get::<_, String>(0),
+    ).ok();
+    let model = conn.query_row(
+        "SELECT value FROM index_metadata WHERE key = 'embedding_model'",
+        [],
+        |row| row.get::<_, String>(0),
+    ).ok();
+    EmbeddingConfig::normalize(provider, String::new(), base_url, model)
 }
 
 fn is_binary_file(path: &Path) -> bool {
@@ -102,127 +193,162 @@ fn chunk_file(content: &str) -> Vec<(String, usize, usize)> {
     chunks
 }
 
-async fn generate_embedding(text: &str, api_key: &str) -> Result<Vec<f32>, String> {
+async fn generate_embedding(text: &str, config: &EmbeddingConfig, input_type: &str) -> Result<Vec<f32>, String> {
     let client = reqwest::Client::new();
-    
-    #[derive(Serialize)]
-    struct EmbeddingRequest {
-        input: String,
-        model: String,
-        encoding_format: String,
-        input_type: String,
+    let base = config.base_url.trim_end_matches('/');
+
+    match config.provider.as_str() {
+        "ollama" => {
+            let response = client
+                .post(format!("{}/api/embeddings", base))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": config.model,
+                    "prompt": text,
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Ollama embedding request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(format!("Ollama embedding API error {}: {}", status, text));
+            }
+
+            let result: Value = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse Ollama embedding response: {}", e))?;
+
+            let embedding = result
+                .get("embedding")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "Ollama embedding missing 'embedding' array".to_string())?
+                .iter()
+                .map(|v| v.as_f64().ok_or_else(|| "Invalid Ollama embedding value".to_string()).map(|x| x as f32))
+                .collect::<Result<Vec<f32>, String>>()?;
+            Ok(embedding)
+        }
+        "groq" => {
+            let prompt = format!(
+                "Generate a JSON array of 128 floating point numbers between -1 and 1 that semantically represents this text. Return ONLY the JSON array, no explanation:\n{}",
+                text
+            );
+            let mut request = client
+                .post(format!("{}/chat/completions", base))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": config.model,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": false
+                }));
+            if !config.api_key.is_empty() {
+                request = request.header("Authorization", format!("Bearer {}", config.api_key));
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| format!("Groq pseudo-embedding request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(format!("Groq pseudo-embedding API error {}: {}", status, text));
+            }
+
+            let result: Value = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse Groq response: {}", e))?;
+            let content = result
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| "Missing Groq completion content".to_string())?;
+
+            let start = content.find('[').ok_or_else(|| "Groq response missing JSON array".to_string())?;
+            let end = content.rfind(']').ok_or_else(|| "Groq response missing array end".to_string())?;
+            let json_slice = &content[start..=end];
+            let raw: Vec<f64> = serde_json::from_str(json_slice)
+                .map_err(|e| format!("Failed to parse Groq pseudo-embedding array: {}", e))?;
+            Ok(raw.into_iter().map(|v| v as f32).collect())
+        }
+        "custom" => {
+            let mut request = client
+                .post(format!("{}/embeddings", base))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "input": text,
+                    "model": config.model,
+                    "encoding_format": "float"
+                }));
+            if !config.api_key.is_empty() {
+                request = request.header("Authorization", format!("Bearer {}", config.api_key));
+            }
+            parse_openai_embedding(request.send().await.map_err(|e| format!("Custom embedding request failed: {}", e))?).await
+        }
+        _ => {
+            let mut request = client
+                .post(format!("{}/embeddings", base))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "input": text,
+                    "model": config.model,
+                    "encoding_format": "float",
+                    "input_type": input_type
+                }));
+            if !config.api_key.is_empty() {
+                request = request.header("Authorization", format!("Bearer {}", config.api_key));
+            }
+            parse_openai_embedding(request.send().await.map_err(|e| format!("NIM embedding request failed: {}", e))?).await
+        }
     }
-
-    #[derive(Deserialize)]
-    struct EmbeddingData {
-        embedding: Vec<f32>,
-    }
-
-    #[derive(Deserialize)]
-    struct EmbeddingResponse {
-        data: Vec<EmbeddingData>,
-    }
-
-    let request = EmbeddingRequest {
-        input: text.to_string(),
-        model: "nvidia/nv-embedqa-e5-v5".to_string(),
-        encoding_format: "float".to_string(),
-        input_type: "passage".to_string(),
-    };
-
-    let response = client
-        .post("https://integrate.api.nvidia.com/v1/embeddings")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("Embedding request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("Embedding API error {}: {}", status, text));
-    }
-
-    let result: EmbeddingResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse embedding response: {}", e))?;
-
-    result
-        .data
-        .into_iter()
-        .next()
-        .map(|d| d.embedding)
-        .ok_or_else(|| "No embedding returned".to_string())
 }
 
-async fn generate_query_embedding(text: &str, api_key: &str) -> Result<Vec<f32>, String> {
-    let client = reqwest::Client::new();
-    
-    #[derive(Serialize)]
-    struct EmbeddingRequest {
-        input: String,
-        model: String,
-        encoding_format: String,
-        input_type: String,
-    }
-
-    #[derive(Deserialize)]
-    struct EmbeddingData {
-        embedding: Vec<f32>,
-    }
-
-    #[derive(Deserialize)]
-    struct EmbeddingResponse {
-        data: Vec<EmbeddingData>,
-    }
-
-    let request = EmbeddingRequest {
-        input: text.to_string(),
-        model: "nvidia/nv-embedqa-e5-v5".to_string(),
-        encoding_format: "float".to_string(),
-        input_type: "query".to_string(),
-    };
-
-    let response = client
-        .post("https://integrate.api.nvidia.com/v1/embeddings")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("Embedding request failed: {}", e))?;
-
+async fn parse_openai_embedding(response: reqwest::Response) -> Result<Vec<f32>, String> {
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         return Err(format!("Embedding API error {}: {}", status, text));
     }
 
-    let result: EmbeddingResponse = response
+    let result: Value = response
         .json()
         .await
         .map_err(|e| format!("Failed to parse embedding response: {}", e))?;
-
-    result
-        .data
-        .into_iter()
-        .next()
-        .map(|d| d.embedding)
-        .ok_or_else(|| "No embedding returned".to_string())
+    let embedding = result
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|x| x.get("embedding"))
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "No embedding returned".to_string())?
+        .iter()
+        .map(|v| v.as_f64().ok_or_else(|| "Invalid embedding value".to_string()).map(|x| x as f32))
+        .collect::<Result<Vec<f32>, String>>()?;
+    Ok(embedding)
 }
 
 #[tauri::command]
 pub async fn index_workspace(
     folder_path: String,
     api_key: String,
+    provider: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
 ) -> Result<IndexProgress, String> {
     let db_path = get_db_path(&folder_path);
 
     let mut conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
     init_db(&mut conn)?;
+    let config = EmbeddingConfig::normalize(provider, api_key, base_url, model);
+    save_embedding_metadata(&conn, &config)?;
 
     // Collect all files to index
     let mut files_to_index = Vec::new();
@@ -271,7 +397,7 @@ pub async fn index_workspace(
 
             for (chunk_index, (chunk_content, start_line, end_line)) in chunks.iter().enumerate() {
                 // Generate embedding
-                match generate_embedding(chunk_content, &api_key).await {
+                match generate_embedding(chunk_content, &config, "passage").await {
                     Ok(embedding) => {
                         // Insert chunk with embedding
                         let embedding_json = serde_json::to_string(&embedding).map_err(|e| e.to_string())?;
@@ -303,6 +429,9 @@ pub async fn search_index(
     query: String,
     api_key: String,
     folder_path: String,
+    provider: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
 ) -> Result<Vec<SearchResult>, String> {
     let db_path = get_db_path(&folder_path);
     println!("search_index called with folder_path: {}", folder_path);
@@ -314,9 +443,16 @@ pub async fn search_index(
     }
 
     let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let db_config = load_embedding_metadata(&conn);
+    let config = EmbeddingConfig::normalize(
+        provider.or_else(|| Some(db_config.provider.clone())),
+        api_key,
+        base_url.or_else(|| Some(db_config.base_url.clone())),
+        model.or_else(|| Some(db_config.model.clone())),
+    );
 
     // Generate query embedding
-    let query_embedding = generate_query_embedding(&query, &api_key).await?;
+    let query_embedding = generate_embedding(&query, &config, "query").await?;
 
     // Get all chunks with embeddings
     let mut stmt = conn.prepare(

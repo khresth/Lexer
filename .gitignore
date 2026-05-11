@@ -13,7 +13,8 @@ dist-ssr
 *.local
 
 # Editor directories and files
-.vscode/*
+.vscode/
+!.vscode/
 !.vscode/extensions.json
 .idea
 .DS_Store
@@ -27,3 +28,26 @@ dist-ssr
 .env
 .env.local
 .env.*.local
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+src-tauri/target/
+
+# Tauri generated
+src-tauri/gen/
+
+# Database index files
+*-lexer.db
+
+# Environment files (if you ever add one)
+.env.*
+
+# OS files
+Thumbs.db
+
+# IDE files
+.idea/
+

@@ -26,7 +26,8 @@ interface Tab {
   language: string;
 }
 
-type ProviderType = "ollama" | "nvidia" | "custom";
+type ProviderType = "ollama" | "nvidia" | "groq" | "custom";
+type EmbeddingProviderType = "nim" | "ollama" | "groq" | "custom";
 
 interface ProviderSettings {
   type: ProviderType;
@@ -34,9 +35,19 @@ interface ProviderSettings {
   ollamaModel: string;
   nvidiaApiKey: string;
   nvidiaModel: string;
+  groqApiKey: string;
+  groqModel: string;
   customBaseUrl: string;
   customApiKey: string;
   customModel: string;
+  completionModel: string;
+}
+
+interface EmbeddingSettings {
+  provider: EmbeddingProviderType;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
 }
 
 interface EditorSettings {
@@ -56,9 +67,19 @@ const DEFAULT_PROVIDER: ProviderSettings = {
   ollamaModel: "qwen2.5-coder:7b",
   nvidiaApiKey: "",
   nvidiaModel: "meta/llama-3.1-8b-instruct",
+  groqApiKey: "",
+  groqModel: "llama-3.3-70b-versatile",
   customBaseUrl: "",
   customApiKey: "",
   customModel: "",
+  completionModel: "qwen2.5-coder:7b",
+};
+
+const DEFAULT_EMBEDDING: EmbeddingSettings = {
+  provider: "nim",
+  apiKey: "",
+  baseUrl: "https://integrate.api.nvidia.com/v1",
+  model: "nvidia/nv-embedqa-e5-v5",
 };
 
 const DEFAULT_EDITOR: EditorSettings = {
@@ -86,6 +107,8 @@ function App() {
   const [draftProvider, setDraftProvider] = useState<ProviderSettings>(DEFAULT_PROVIDER);
   const [draftEditor, setDraftEditor] = useState<EditorSettings>(DEFAULT_EDITOR);
   const [embeddingApiKey, setEmbeddingApiKey] = useState<string>("");
+  const [embeddingSettings, setEmbeddingSettings] = useState<EmbeddingSettings>(DEFAULT_EMBEDDING);
+  const [draftEmbedding, setDraftEmbedding] = useState<EmbeddingSettings>(DEFAULT_EMBEDDING);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -107,6 +130,26 @@ function App() {
   const terminalResizingRef = useRef(false);
   const [indexStatus, setIndexStatus] = useState<{ type: 'idle' | 'indexing' | 'ready' | 'error'; message: string }>({ type: 'idle', message: '' });
 
+  const runWorkspaceIndex = useCallback(async (settings: EmbeddingSettings, statusMessage = "Indexing...") => {
+    if (!rootPath) return;
+    if (settings.provider !== "ollama" && !settings.apiKey) return;
+    setIndexStatus({ type: "indexing", message: statusMessage });
+    try {
+      const result = await invoke<{ indexed: number; total: number }>("index_workspace", {
+        folderPath: rootPath,
+        apiKey: settings.apiKey,
+        provider: settings.provider,
+        baseUrl: settings.baseUrl,
+        model: settings.model,
+      });
+      setIndexStatus({ type: "ready", message: `Index ready (${result.indexed} files)` });
+    } catch (error) {
+      const errMsg = typeof error === "string" ? error : (error as Error).message || "Unknown error";
+      setIndexStatus({ type: "error", message: `Index failed: ${errMsg}` });
+      console.error("Indexing error:", error);
+    }
+  }, [rootPath]);
+
   // Load settings on startup
   useEffect(() => {
     (async () => {
@@ -114,23 +157,39 @@ function App() {
         const store = await getStore();
         const savedProvider = await store.get<ProviderSettings>("provider");
         const savedEditor = await store.get<EditorSettings>("editor");
+        const savedEmbeddingProvider = await store.get<EmbeddingProviderType>("embeddingProvider");
         const savedEmbeddingKey = await store.get<string>("embeddingApiKey");
+        const savedEmbeddingBaseUrl = await store.get<string>("embeddingBaseUrl");
+        const savedEmbeddingModel = await store.get<string>("embeddingModel");
+        const savedGroqApiKey = await store.get<string>("groqApiKey");
+        const savedGroqModel = await store.get<string>("groqModel");
+        const savedCompletionModel = await store.get<string>("completionModel");
         
         if (savedProvider) {
-          setProviderSettings(savedProvider);
-          setDraftProvider(savedProvider);
+          const hydratedProvider = {
+            ...DEFAULT_PROVIDER,
+            ...savedProvider,
+            groqApiKey: savedGroqApiKey ?? savedProvider.groqApiKey ?? DEFAULT_PROVIDER.groqApiKey,
+            groqModel: savedGroqModel ?? savedProvider.groqModel ?? DEFAULT_PROVIDER.groqModel,
+            completionModel: savedCompletionModel ?? savedProvider.completionModel ?? savedProvider.ollamaModel ?? DEFAULT_PROVIDER.completionModel,
+          };
+          setProviderSettings(hydratedProvider);
+          setDraftProvider(hydratedProvider);
         }
         if (savedEditor) {
           setEditorSettings(savedEditor);
           setDraftEditor(savedEditor);
         }
-        
-        // Set embedding API key, defaulting to existing NIM key if not set
-        if (savedEmbeddingKey) {
-          setEmbeddingApiKey(savedEmbeddingKey);
-        } else if (savedProvider?.nvidiaApiKey) {
-          setEmbeddingApiKey(savedProvider.nvidiaApiKey);
-        }
+
+        const embeddingFromStore: EmbeddingSettings = {
+          provider: savedEmbeddingProvider ?? DEFAULT_EMBEDDING.provider,
+          apiKey: savedEmbeddingKey ?? "",
+          baseUrl: savedEmbeddingBaseUrl ?? DEFAULT_EMBEDDING.baseUrl,
+          model: savedEmbeddingModel ?? DEFAULT_EMBEDDING.model,
+        };
+        setEmbeddingSettings(embeddingFromStore);
+        setDraftEmbedding(embeddingFromStore);
+        setEmbeddingApiKey(embeddingFromStore.apiKey);
       } catch (error) {
         console.error("Error loading settings:", error);
       }
@@ -139,40 +198,50 @@ function App() {
 
   // Background index workspace when folder opens
   useEffect(() => {
-    if (!rootPath || !embeddingApiKey) return;
-
-    const runIndex = async () => {
-      setIndexStatus({ type: 'indexing', message: 'Indexing...' });
-      try {
-        const result = await invoke<{ indexed: number; total: number }>('index_workspace', {
-          folderPath: rootPath,
-          apiKey: embeddingApiKey
-        });
-        setIndexStatus({ type: 'ready', message: `Index ready (${result.indexed} files)` });
-      } catch (error) {
-        const errMsg = typeof error === 'string' ? error : (error as Error).message || 'Unknown error';
-        setIndexStatus({ type: 'error', message: `Index failed: ${errMsg}` });
-        console.error('Indexing error:', error);
-      }
-    };
-
-    runIndex();
-  }, [rootPath, embeddingApiKey]);
+    if (!rootPath) return;
+    runWorkspaceIndex(embeddingSettings);
+  }, [rootPath, embeddingSettings, runWorkspaceIndex]);
 
   const saveSettings = useCallback(async () => {
     try {
+      const previousEmbeddingProvider = embeddingSettings.provider;
       const store = await getStore();
-      await store.set("provider", draftProvider);
+      const nextProvider = {
+        ...draftProvider,
+        groqApiKey: draftProvider.groqApiKey,
+        groqModel: draftProvider.groqModel,
+        completionModel: draftProvider.completionModel || (
+          draftProvider.type === "ollama" ? draftProvider.ollamaModel :
+          draftProvider.type === "nvidia" ? draftProvider.nvidiaModel :
+          draftProvider.type === "groq" ? draftProvider.groqModel :
+          draftProvider.customModel
+        ),
+      };
+      await store.set("provider", nextProvider);
       await store.set("editor", draftEditor);
-      await store.set("embeddingApiKey", embeddingApiKey);
+      await store.set("groqApiKey", draftProvider.groqApiKey);
+      await store.set("groqModel", draftProvider.groqModel);
+      await store.set("completionModel", nextProvider.completionModel);
+      await store.set("embeddingProvider", draftEmbedding.provider);
+      await store.set("embeddingApiKey", draftEmbedding.apiKey);
+      await store.set("embeddingBaseUrl", draftEmbedding.baseUrl);
+      await store.set("embeddingModel", draftEmbedding.model);
       await store.save();
-      setProviderSettings(draftProvider);
+      setProviderSettings(nextProvider);
       setEditorSettings(draftEditor);
+      setEmbeddingSettings(draftEmbedding);
+      setEmbeddingApiKey(draftEmbedding.apiKey);
       setSettingsOpen(false);
+
+      if (rootPath && draftEmbedding.provider !== previousEmbeddingProvider && (draftEmbedding.provider === "ollama" || !!draftEmbedding.apiKey)) {
+        setIndexStatus({ type: "indexing", message: "Re-indexing..." });
+        await invoke("clear_index", { folderPath: rootPath });
+        await runWorkspaceIndex(draftEmbedding, "Re-indexing...");
+      }
     } catch (error) {
       console.error("Error saving settings:", error);
     }
-  }, [draftProvider, draftEditor, embeddingApiKey]);
+  }, [draftProvider, draftEditor, draftEmbedding, embeddingSettings.provider, rootPath, runWorkspaceIndex]);
 
   const getLanguageFromExtension = useCallback((filename: string): string => {
     const ext = filename.split('.').pop()?.toLowerCase();
@@ -297,8 +366,24 @@ function App() {
         return { baseUrl: providerSettings.ollamaBaseUrl, model: providerSettings.ollamaModel, apiKey: "" };
       case "nvidia":
         return { baseUrl: "https://integrate.api.nvidia.com/v1", model: providerSettings.nvidiaModel, apiKey: providerSettings.nvidiaApiKey };
+      case "groq":
+        return { baseUrl: "https://api.groq.com/openai/v1", model: providerSettings.groqModel, apiKey: providerSettings.groqApiKey };
       case "custom":
         return { baseUrl: providerSettings.customBaseUrl, model: providerSettings.customModel, apiKey: providerSettings.customApiKey };
+    }
+  }, [providerSettings]);
+
+  const getCompletionModel = useCallback(() => {
+    if (providerSettings.completionModel) return providerSettings.completionModel;
+    switch (providerSettings.type) {
+      case "ollama":
+        return providerSettings.ollamaModel;
+      case "nvidia":
+        return providerSettings.nvidiaModel;
+      case "groq":
+        return providerSettings.groqModel;
+      case "custom":
+        return providerSettings.customModel;
     }
   }, [providerSettings]);
 
@@ -339,7 +424,7 @@ function App() {
       const result = await invoke<string>('ai_chat', {
         url,
         apiKey: config.apiKey,
-        model: config.model,
+        model: getCompletionModel(),
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: context },
@@ -392,7 +477,7 @@ function App() {
       console.error('Completion request failed:', error);
       setIsCompleting(false);
     }
-  }, [activeTab, getProviderConfig]);
+  }, [activeTab, getProviderConfig, getCompletionModel]);
 
   const handleEditorMount: OnMount = useCallback((editor, monaco) => {
     editorRef.current = editor;
@@ -690,7 +775,7 @@ Answer based on the actual project code shown above.`;
               <button className="tab-close" onClick={(e) => { e.stopPropagation(); closeTab(tab.path); }}>✕</button>
             </div>
           ))}
-          <button className="settings-btn" onClick={() => { setDraftProvider(providerSettings); setDraftEditor(editorSettings); setSettingsOpen(true); }}>⚙</button>
+          <button className="settings-btn" onClick={() => { setDraftProvider(providerSettings); setDraftEditor(editorSettings); setDraftEmbedding(embeddingSettings); setSettingsOpen(true); }}>⚙</button>
           <button className="terminal-btn" onClick={() => setTerminalOpen(!terminalOpen)} title="Toggle Terminal">⌨</button>
         </div>
         <div className="editor-container-inner">
@@ -751,7 +836,9 @@ Answer based on the actual project code shown above.`;
                 <p className="placeholder-subtext">Messages will appear here</p>
               </div>
             ) : (
-              messages.map((msg, i) => (
+              messages.map((msg, i) => {
+                const uniqueFiles = [...new Set(contextFiles)];
+                return (
                 <div key={i} className={`chat-bubble chat-bubble-${msg.role}`}>
                   <div className="chat-bubble-role">{msg.role === "user" ? "You" : msg.role === "assistant" ? "AI" : "Error"}</div>
                   <div className="chat-bubble-content">{msg.content}</div>
@@ -763,18 +850,18 @@ Answer based on the actual project code shown above.`;
                           el.classList.toggle('chat-context-files-expanded');
                         }
                       }}>
-                        Context used: {contextFiles.length > 0 ? `${contextFiles.length} files` : 'Active file only'}
+                        Context used: {uniqueFiles.length > 0 ? `${uniqueFiles.length} files` : 'Active file only'}
                         <span className="chat-context-toggle">▼</span>
                       </div>
                       <div className={`chat-context-files chat-context-files-${i}`}>
-                        {contextFiles.map((file, j) => (
+                        {uniqueFiles.map((file, j) => (
                           <div key={j} className="chat-context-file">{file}</div>
                         ))}
                       </div>
                     </div>
                   )}
                 </div>
-              ))
+              )})
             )}
             {isStreaming && <div className="chat-streaming-indicator">●●●</div>}
             <div ref={messagesEndRef} />
@@ -802,12 +889,13 @@ Answer based on the actual project code shown above.`;
               <button className="modal-close" onClick={() => setSettingsOpen(false)}>✕</button>
             </div>
             <div className="modal-body">
-              <h3>AI Provider</h3>
+              <h3>Chat Model</h3>
               <div className="settings-group">
                 <label className="settings-label">Active Provider</label>
                 <select className="settings-select" value={draftProvider.type} onChange={(e) => setDraftProvider({ ...draftProvider, type: e.target.value as ProviderType })}>
                   <option value="ollama">Ollama (Local)</option>
                   <option value="nvidia">NVIDIA NIM</option>
+                  <option value="groq">Groq</option>
                   <option value="custom">Custom BYOK</option>
                 </select>
               </div>
@@ -819,7 +907,7 @@ Answer based on the actual project code shown above.`;
                     <input className="settings-input" type="text" value={draftProvider.ollamaBaseUrl} onChange={(e) => setDraftProvider({ ...draftProvider, ollamaBaseUrl: e.target.value })} />
                   </div>
                   <div className="settings-group">
-                    <label className="settings-label">Model</label>
+                    <label className="settings-label">Model Name</label>
                     <input className="settings-input" type="text" value={draftProvider.ollamaModel} onChange={(e) => setDraftProvider({ ...draftProvider, ollamaModel: e.target.value })} />
                   </div>
                 </>
@@ -836,7 +924,7 @@ Answer based on the actual project code shown above.`;
                     <input className="settings-input" type="text" value="https://integrate.api.nvidia.com/v1" readOnly />
                   </div>
                   <div className="settings-group">
-                    <label className="settings-label">Model</label>
+                    <label className="settings-label">Model Name</label>
                     <input className="settings-input" type="text" value={draftProvider.nvidiaModel} onChange={(e) => setDraftProvider({ ...draftProvider, nvidiaModel: e.target.value })} />
                   </div>
                 </>
@@ -853,23 +941,147 @@ Answer based on the actual project code shown above.`;
                     <input className="settings-input" type="password" value={draftProvider.customApiKey} onChange={(e) => setDraftProvider({ ...draftProvider, customApiKey: e.target.value })} />
                   </div>
                   <div className="settings-group">
-                    <label className="settings-label">Model</label>
+                    <label className="settings-label">Model Name</label>
                     <input className="settings-input" type="text" value={draftProvider.customModel} onChange={(e) => setDraftProvider({ ...draftProvider, customModel: e.target.value })} />
                   </div>
                 </>
               )}
 
-              <h3>Workspace Indexing</h3>
+              {draftProvider.type === "groq" && (
+                <>
+                  <div className="settings-group">
+                    <label className="settings-label">API Key</label>
+                    <input className="settings-input" type="password" value={draftProvider.groqApiKey} onChange={(e) => setDraftProvider({ ...draftProvider, groqApiKey: e.target.value })} placeholder="gsk_..." />
+                  </div>
+                  <div className="settings-group">
+                    <label className="settings-label">Base URL</label>
+                    <input className="settings-input" type="text" value="https://api.groq.com/openai/v1" readOnly />
+                  </div>
+                  <div className="settings-group">
+                    <label className="settings-label">Model Name</label>
+                    <select className="settings-select" value={draftProvider.groqModel} onChange={(e) => setDraftProvider({ ...draftProvider, groqModel: e.target.value })}>
+                      <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile</option>
+                      <option value="llama-3.1-8b-instant">llama-3.1-8b-instant</option>
+                      <option value="mixtral-8x7b-32768">mixtral-8x7b-32768</option>
+                      <option value="gemma2-9b-it">gemma2-9b-it</option>
+                    </select>
+                  </div>
+                </>
+              )}
+
               <div className="settings-group">
-                <label className="settings-label">NIM Embedding API Key (for workspace indexing)</label>
-                <input 
-                  className="settings-input" 
-                  type="password" 
-                  value={embeddingApiKey} 
-                  onChange={(e) => setEmbeddingApiKey(e.target.value)} 
-                  placeholder="nvapi-..." 
+                <label className="settings-label">Completion Model (for ghost text - use a faster model)</label>
+                <input
+                  className="settings-input"
+                  type="text"
+                  value={draftProvider.completionModel}
+                  onChange={(e) => setDraftProvider({ ...draftProvider, completionModel: e.target.value })}
+                  placeholder={draftProvider.type === "groq" ? "llama-3.1-8b-instant" : "Defaults to chat model"}
                 />
               </div>
+
+              <h3>Embedding Model</h3>
+              <div className="settings-group">
+                <label className="settings-label">Active Embedding Provider</label>
+                <select
+                  className="settings-select"
+                  value={draftEmbedding.provider}
+                  onChange={(e) => {
+                    const next = e.target.value as EmbeddingProviderType;
+                    if (next === "nim") {
+                      setDraftEmbedding({ provider: "nim", apiKey: draftEmbedding.apiKey, baseUrl: "https://integrate.api.nvidia.com/v1", model: "nvidia/nv-embedqa-e5-v5" });
+                    } else if (next === "ollama") {
+                      setDraftEmbedding({ provider: "ollama", apiKey: "", baseUrl: "http://localhost:11434", model: "nomic-embed-text" });
+                    } else if (next === "groq") {
+                      setDraftEmbedding({ provider: "groq", apiKey: draftProvider.groqApiKey || draftEmbedding.apiKey, baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.1-8b-instant" });
+                    } else {
+                      setDraftEmbedding({ provider: "custom", apiKey: draftEmbedding.apiKey, baseUrl: draftEmbedding.baseUrl, model: draftEmbedding.model });
+                    }
+                  }}
+                >
+                  <option value="nim">NVIDIA NIM (recommended)</option>
+                  <option value="ollama">Ollama (local/free)</option>
+                  <option value="groq">Groq (approximate, no dedicated API)</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </div>
+
+              {draftEmbedding.provider === "nim" && (
+                <>
+                  <div className="settings-group">
+                    <label className="settings-label">API Key</label>
+                    <input
+                      className="settings-input"
+                      type="password"
+                      value={draftEmbedding.apiKey}
+                      onChange={(e) => setDraftEmbedding({ ...draftEmbedding, apiKey: e.target.value })}
+                      placeholder="nvapi-..."
+                    />
+                  </div>
+                  <div className="settings-group">
+                    <label className="settings-label">Base URL</label>
+                    <input className="settings-input" type="text" value="https://integrate.api.nvidia.com/v1" readOnly />
+                  </div>
+                  <div className="settings-group">
+                    <label className="settings-label">Model</label>
+                    <input className="settings-input" type="text" value="nvidia/nv-embedqa-e5-v5" readOnly />
+                  </div>
+                </>
+              )}
+
+              {draftEmbedding.provider === "ollama" && (
+                <>
+                  <div className="settings-group">
+                    <label className="settings-label">Base URL</label>
+                    <input className="settings-input" type="text" value={draftEmbedding.baseUrl} onChange={(e) => setDraftEmbedding({ ...draftEmbedding, baseUrl: e.target.value })} />
+                  </div>
+                  <div className="settings-group">
+                    <label className="settings-label">Model</label>
+                    <input className="settings-input" type="text" value={draftEmbedding.model} onChange={(e) => setDraftEmbedding({ ...draftEmbedding, model: e.target.value })} />
+                  </div>
+                </>
+              )}
+
+              {draftEmbedding.provider === "groq" && (
+                <>
+                  <div className="settings-group">
+                    <label className="settings-label">API Key</label>
+                    <input
+                      className="settings-input"
+                      type="password"
+                      value={draftEmbedding.apiKey}
+                      onChange={(e) => setDraftEmbedding({ ...draftEmbedding, apiKey: e.target.value })}
+                      placeholder="gsk_..."
+                    />
+                  </div>
+                  <div className="settings-group">
+                    <label className="settings-label">Model</label>
+                    <input
+                      className="settings-input"
+                      type="text"
+                      value={draftEmbedding.model}
+                      onChange={(e) => setDraftEmbedding({ ...draftEmbedding, model: e.target.value })}
+                    />
+                  </div>
+                </>
+              )}
+
+              {draftEmbedding.provider === "custom" && (
+                <>
+                  <div className="settings-group">
+                    <label className="settings-label">Base URL</label>
+                    <input className="settings-input" type="text" value={draftEmbedding.baseUrl} onChange={(e) => setDraftEmbedding({ ...draftEmbedding, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" />
+                  </div>
+                  <div className="settings-group">
+                    <label className="settings-label">API Key</label>
+                    <input className="settings-input" type="password" value={draftEmbedding.apiKey} onChange={(e) => setDraftEmbedding({ ...draftEmbedding, apiKey: e.target.value })} />
+                  </div>
+                  <div className="settings-group">
+                    <label className="settings-label">Model</label>
+                    <input className="settings-input" type="text" value={draftEmbedding.model} onChange={(e) => setDraftEmbedding({ ...draftEmbedding, model: e.target.value })} />
+                  </div>
+                </>
+              )}
 
               <h3>Editor</h3>
               <div className="settings-group">
